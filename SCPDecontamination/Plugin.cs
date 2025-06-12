@@ -8,41 +8,28 @@ using Exiled.API.Features.Doors;
 using Exiled.API.Interfaces;
 using MEC;
 using PlayerRoles;
+using UnityEngine;
 
 namespace ScpDecontamination
 {
     public class Config : IConfig
     {
-        [Description("Включен ли плагин?")]
         public bool IsEnabled { get; set; } = true;
-
-        [Description("Включить ли отладочные сообщения в консоли? Помогает понять, почему плагин не срабатывает.")]
         public bool Debug { get; set; } = false;
-
-        [Description("Имя главной двери камеры SCP-914, за которой нужно следить.")]
         public string TargetDoorName { get; set; } = "914";
-
-        [Description("Длительность эффекта обеззараживания, применяемого каждый тик. Должна быть чуть больше интервала проверки.")]
         public float EffectDuration { get; set; } = 2.5f;
-
-        [Description("Интервал в секундах, с которым плагин проверяет комнату.")]
         public float CheckInterval { get; set; } = 1.0f;
-
-        [Description("Сообщение C.A.S.S.I.E. при АКТИВАЦИИ процесса обеззараживания.")]
         public string CassieMessageOnStart { get; set; } = "pitch_0.15 .g4 .g4 pitch_1 Attention . .g3 decontamination sequence activated";
-
-        [Description("Сообщение C.A.S.S.I.E. при ЗАВЕРШЕНИИ процесса обеззараживания.")]
         public string CassieMessageOnEnd { get; set; } = "decontamination sequence complete . .g3 . all systems nominal";
-
-        [Description("Список ролей SCP, на которых не будет срабатывать протокол обеззараживания.")]
         public List<RoleTypeId> ExcludedScps { get; set; } = new List<RoleTypeId> { RoleTypeId.Scp106 };
+        public float InsideDotProductThreshold { get; set; } = -0.1f;
     }
     
     public class Plugin : Plugin<Config>
     {
         public override string Name => "ScpDecontamination";
-        public override string Author => "honvert & Gemini";
-        public override Version Version => new Version(2, 4, 0); // Версия обновлена
+        public override string Author => "honvert";
+        public override Version Version => new Version(2, 6, 0);
 
         public static Plugin Instance { get; private set; }
 
@@ -54,97 +41,135 @@ namespace ScpDecontamination
             Instance = this;
             Log.Info($"Плагин {Name} версии {Version} включен.");
             _isProcessActive = false; 
-            _mainCoroutine = Timing.RunCoroutine(MonitorRoomCoroutine());
+            _mainCoroutine = Timing.RunCoroutine(MonitorStateCoroutine());
             base.OnEnabled();
         }
 
         public override void OnDisabled()
         {
             Timing.KillCoroutines(_mainCoroutine);
+            if (_isProcessActive)
+            {
+                Door door = Door.Get(Config.TargetDoorName);
+                if (door != null)
+                    door.ChangeLock(DoorLockType.None);
+
+                Room chamber = Room.Get(RoomType.Lcz914);
+                if (chamber != null)
+                {
+                    foreach (var player in chamber.Players)
+                        player.DisableEffect(EffectType.Decontaminating);
+                }
+            }
+            _isProcessActive = false;
             Instance = null;
             Log.Info($"Плагин {Name} выключен.");
             base.OnDisabled();
         }
-
-        private IEnumerator<float> MonitorRoomCoroutine()
+        
+        private bool IsPlayerTrulyInside(Player player, Door mainDoor)
         {
-            if (Config.Debug) Log.Debug("Главная корутина запущена.");
+            if (player == null || mainDoor == null) return false;
+
+            Vector3 doorPosition = mainDoor.Position;
+            Vector3 doorForward = mainDoor.Transform.forward;
+            Vector3 directionToPlayer = player.Position - doorPosition;
+            float dotProduct = Vector3.Dot(directionToPlayer.normalized, doorForward);
+            
+            return dotProduct < Config.InsideDotProductThreshold;
+        }
+
+        private IEnumerator<float> MonitorStateCoroutine()
+        {
             yield return Timing.WaitForSeconds(5f); 
 
             while (true)
             {
                 yield return Timing.WaitForSeconds(Config.CheckInterval); 
 
-                try
+                if (Round.IsEnded)
                 {
-                    // ИСПРАВЛЕНИЕ: Получаем комнату и дверь отдельно для максимальной точности
-                    Room chamberRoom = Room.Get(RoomType.Lcz914); 
-                    Door mainDoor = Door.Get(Config.TargetDoorName); 
-
-                    if (chamberRoom == null)
-                    {
-                        if (Config.Debug) Log.Warn($"[ОТЛАДКА] Не удалось найти комнату-камеру SCP-914 (Lcz914).");
-                        continue;
-                    }
-
-                    if (mainDoor == null)
-                    {
-                        if (Config.Debug) Log.Warn($"[ОТЛАДКА] Не удалось найти главную дверь с именем '{Config.TargetDoorName}'.");
-                        continue;
-                    }
-
-                    // --- Определяем условия ---
-                    List<Player> playersInChamber = chamberRoom.Players.ToList();
-                    bool isScpInChamber = playersInChamber.Any(p => p.IsScp && p.IsAlive && !Config.ExcludedScps.Contains(p.Role.Type));
-                    
-                    bool isDoorFullyClosed = mainDoor.IsFullyClosed;
-
-                    if (Config.Debug) Log.Debug($"[ОТЛАДКА] Проверка состояния: SCP в камере: {isScpInChamber}, Дверь закрыта: {isDoorFullyClosed}, Процесс активен: {_isProcessActive}");
-
-                    // --- Условие СТАРТА: SCP ВНУТРИ камеры, ГЛАВНАЯ ДВЕРЬ закрыта, и процесс еще не активен ---
-                    if (isScpInChamber && isDoorFullyClosed && !_isProcessActive)
-                    {
-                        _isProcessActive = true;
-                        Log.Info($"SCP в закрытой камере {chamberRoom.Type}. Активация протокола.");
-                        Timing.RunCoroutine(ActivationSequence(mainDoor));
-                    }
-                    // --- Условие ОСТАНОВКИ: Процесс активен, но SCP вышел ИЛИ главная дверь открылась ---
-                    else if ((!isScpInChamber || !isDoorFullyClosed) && _isProcessActive)
+                    if (_isProcessActive) 
                     {
                         _isProcessActive = false;
-                        Log.Info($"Условия деактивации выполнены (SCP покинул камеру или дверь открыта). Деактивация протокола.");
+                        Door doorOnRoundEnd = Door.Get(Config.TargetDoorName);
+                        Room chamberOnRoundEnd = Room.Get(RoomType.Lcz914);
+                        if (doorOnRoundEnd != null)
+                            doorOnRoundEnd.ChangeLock(DoorLockType.None);
                         
-                        // Снимаем эффект у всех игроков, которые могли быть в камере
-                        foreach (var player in playersInChamber)
+                        if (chamberOnRoundEnd != null)
+                        {
+                            foreach (var p in chamberOnRoundEnd.Players)
+                                p.DisableEffect(EffectType.Decontaminating);
+                        }
+                    }
+                    continue;
+                }
+
+                try
+                {
+                    Door mainDoor = Door.Get(Config.TargetDoorName); 
+                    Room chamberRoom = Room.Get(RoomType.Lcz914);
+
+                    if (mainDoor == null || chamberRoom == null)
+                    {
+                        continue;
+                    }
+                    
+                    List<Player> playersTrulyInsideMachine = new List<Player>();
+                    foreach (var player in chamberRoom.Players)
+                    {
+                        if (IsPlayerTrulyInside(player, mainDoor))
+                        {
+                            playersTrulyInsideMachine.Add(player);
+                        }
+                    }
+
+                    bool isScpTrulyInsideMachine = playersTrulyInsideMachine.Any(p => p.IsScp && p.IsAlive && !Config.ExcludedScps.Contains(p.Role.Type));
+                    bool isMainDoorClosed = mainDoor.IsFullyClosed; 
+                    
+                    if (isScpTrulyInsideMachine && isMainDoorClosed && !_isProcessActive)
+                    {
+                        _isProcessActive = true;
+                        Log.Info($"SCP в закрытой камере SCP-914. Активация протокола.");
+                        Timing.RunCoroutine(ActivationSequence(mainDoor));
+                    }
+                    else if ((!isScpTrulyInsideMachine || !isMainDoorClosed) && _isProcessActive)
+                    {
+                        _isProcessActive = false;
+                        Log.Info($"Условия деактивации (SCP не внутри машины или дверь '{mainDoor.Name}' открыта). Деактивация протокола.");
+                        
+                        foreach (var player in playersTrulyInsideMachine)
                         {
                             player.DisableEffect(EffectType.Decontaminating);
                         }
-                        if (Config.Debug) Log.Debug("Эффект обеззараживания снят.");
-
-                        mainDoor.ChangeLock(DoorLockType.None);
-                        if (Config.Debug) Log.Debug($"Главная дверь '{mainDoor.Name}' разблокирована.");
+                        
+                        mainDoor.ChangeLock(DoorLockType.None); 
                         
                         if (!string.IsNullOrWhiteSpace(Config.CassieMessageOnEnd))
                             Cassie.Message(Config.CassieMessageOnEnd, isNoisy: true, isSubtitles: true);
                     }
 
-                    // --- Применение эффекта, если процесс активен ---
                     if (_isProcessActive)
                     {
-                        if (Config.Debug) Log.Debug("Процесс активен. Применение эффектов.");
-                        foreach (Player player in playersInChamber)
+                        foreach (Player player in playersTrulyInsideMachine)
                         {
                             if (player.IsAlive)
                             {
                                 player.EnableEffect(EffectType.Decontaminating, Config.EffectDuration, false);
-                                if (Config.Debug) Log.Debug($"Применен эффект обеззараживания к {player.Nickname}.");
                             }
                         }
                     }
                 }
                 catch (Exception e)
                 {
-                    Log.Error($"Произошла ошибка в MonitorRoomCoroutine: {e}");
+                    Log.Error($"Произошла ошибка в MonitorStateCoroutine: {e}");
+                    if (_isProcessActive)
+                    {
+                        Door doorOnError = Door.Get(Config.TargetDoorName);
+                        if (doorOnError!= null) doorOnError.ChangeLock(DoorLockType.None);
+                        _isProcessActive = false;
+                    }
                 }
             }
         }
@@ -152,14 +177,18 @@ namespace ScpDecontamination
         private IEnumerator<float> ActivationSequence(Door doorToControl)
         {
             if (!string.IsNullOrWhiteSpace(Config.CassieMessageOnStart))
+            {
                 Cassie.Message(Config.CassieMessageOnStart, isNoisy: true, isSubtitles: true);
+            }
             
-            // Дверь уже должна быть закрыта по условию, поэтому мы ее только блокируем
-            if (Config.Debug) Log.Debug($"Блокировка главной двери '{doorToControl.Name}'...");
+            if (!doorToControl.IsFullyClosed)
+            {
+                doorToControl.IsOpen = false; 
+                yield return Timing.WaitForSeconds(0.75f); 
+            }
+            
             doorToControl.ChangeLock(DoorLockType.AdminCommand);
-            
-            Log.Info($"Главная дверь '{doorToControl.Name}' в комнате {doorToControl.Room.Type} заблокирована.");
-            yield break;
+            Log.Info($"Главная дверь '{doorToControl.Name}' (комната: {doorToControl.Room?.Type}) закрыта и заблокирована.");
         }
     }
 }
