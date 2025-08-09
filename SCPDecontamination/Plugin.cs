@@ -6,6 +6,7 @@ using Exiled.API.Enums;
 using Exiled.API.Features;
 using Exiled.API.Features.Doors;
 using Exiled.API.Interfaces;
+using Exiled.Events.Handlers;
 using MEC;
 using PlayerRoles;
 using UnityEngine;
@@ -35,12 +36,14 @@ namespace ScpDecontamination
 
         private CoroutineHandle _mainCoroutine;
         private bool _isProcessActive;
+        public bool IsPermanentlyDisabled;
         
         public override void OnEnabled()
         {
             Instance = this;
             Log.Info($"Плагин {Name} версии {Version} включен.");
-            _isProcessActive = false; 
+            _isProcessActive = false;
+            Server.RoundStarted += OnRoundStarted;
             _mainCoroutine = Timing.RunCoroutine(MonitorStateCoroutine());
             base.OnEnabled();
         }
@@ -62,9 +65,41 @@ namespace ScpDecontamination
                 }
             }
             _isProcessActive = false;
+            Server.RoundStarted -= OnRoundStarted;
             Instance = null;
             Log.Info($"Плагин {Name} выключен.");
             base.OnDisabled();
+        }
+
+        private void OnRoundStarted()
+        {
+            IsPermanentlyDisabled = false;
+            Log.Info("Decontamination status reset for new round.");
+        }
+
+        public void SetDecontaminationDisabled(bool isDisabled)
+        {
+            IsPermanentlyDisabled = isDisabled;
+            var status = isDisabled ? "disabled" : "enabled";
+            Log.Info($"Decontamination {status} by command.");
+
+            if (isDisabled && _isProcessActive)
+            {
+                _isProcessActive = false;
+                Door door = Door.Get(Config.TargetDoorName);
+                if (door != null)
+                    door.ChangeLock(DoorLockType.None);
+
+                Room chamber = Room.Get(RoomType.Lcz914);
+                if (chamber != null)
+                {
+                    foreach (var player in chamber.Players)
+                        player.DisableEffect(EffectType.Decontaminating);
+                }
+
+                if (!string.IsNullOrWhiteSpace(Config.CassieMessageOnEnd))
+                    Cassie.Message(Config.CassieMessageOnEnd, isNoisy: true, isSubtitles: true);
+            }
         }
         
         private bool IsPlayerTrulyInside(Player player, Door mainDoor)
@@ -86,6 +121,9 @@ namespace ScpDecontamination
             while (true)
             {
                 yield return Timing.WaitForSeconds(Config.CheckInterval); 
+
+                if (IsPermanentlyDisabled)
+                    continue;
 
                 if (Round.IsEnded)
                 {
